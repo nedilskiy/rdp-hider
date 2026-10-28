@@ -1,15 +1,18 @@
 #include "RdpController.h"
 #include "ArtifactCleaner.h"
+#include "CredentialManager.h"
 #include "Logger.h"
 #include <windows.h>
 #include <tlhelp32.h>
 #include <fstream>
 #include <thread>
+#include <vector>
 
 struct EnumWindowsCallbackArgs {
     DWORD processId;
     HWND hwndFound;
 };
+
 
 BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     EnumWindowsCallbackArgs* args = (EnumWindowsCallbackArgs*)lParam;
@@ -60,8 +63,15 @@ std::vector<DWORD> RdpController::GetProcessIds(const std::wstring& processName)
 void RdpController::DisconnectAll() {
     Logger::Log(L"Initiating DisconnectAll for RDP sessions.");
 
-    // Определяем целевые клиенты
-    std::vector<std::wstring> targets = { L"mstsc.exe", L"msrdc.exe" };
+    // Полный список процессов классического RDP и нового Windows App
+    std::vector<std::wstring> targets = {
+        L"mstsc.exe",
+        L"msrdc.exe",
+        L"msrdcw.exe",
+        L"RemoteDesktop.exe",
+        L"WindowsApp.exe",
+        L"Windows365.exe"
+    };
 
     for (const auto& target : targets) {
         std::vector<DWORD> pids = GetProcessIds(target);
@@ -74,6 +84,7 @@ void RdpController::DisconnectAll() {
     // Очищаем артефакты после закрытия сессий
     ArtifactCleaner::ClearRdpArtifacts();
     ArtifactCleaner::ClearRdpEventLogs();
+
 }
 
 
