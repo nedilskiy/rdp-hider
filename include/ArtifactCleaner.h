@@ -9,5 +9,7 @@ public:
     static void DeleteTempRdpFile(const std::wstring& filePath);
     static void ClearRdpEventLogs();
     static void ClearJumpListsAndSearchCache();
+    static void ClearWindowsAppArtifacts();
+    static void ClearDevolutionsRdmArtifacts();
     static void RestartSearchUI();
 };

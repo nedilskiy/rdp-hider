@@ -42,10 +42,18 @@ void PowerMonitor::Start() {
     }
 
     m_running = true;
-    Logger::Log(L"PowerMonitor started. Listening for PBT_APMSUSPEND and Lid Switch.");
+    Logger::Log(L"PowerMonitor started. Listening for PBT_APMSUSPEND, Lid Switch and Hotkeys.");
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0) && m_running) {
+        if (msg.message == WM_HOTKEY) {
+            // Передаем ID нажатого хоткея в контроллер
+            if (msg.wParam == 1001) RdpController::LaunchClientAndInject(1); // mstsc
+            else if (msg.wParam == 1002) RdpController::LaunchClientAndInject(2); // WinApp
+            else if (msg.wParam == 1003) RdpController::LaunchClientAndInject(3); // Devolutions
+            else if (msg.wParam == 1004) RdpController::ShowCredentials();
+        }
+
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
