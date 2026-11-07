@@ -10,6 +10,7 @@
 #include <psapi.h> // Обязательно
 #include <shellapi.h>
 #include <wincred.h>
+#include <iostream>
 
 static void SendKey(WORD vkCode) {
     INPUT input[2] = {};
@@ -43,6 +44,36 @@ static void ResetModifierKeys() {
     Sleep(200);
 }
 
+void RdpController::ReconfigureCredentials() {
+    ResetModifierKeys();
+
+    if (AllocConsole()) {
+        FILE* fpOut = nullptr;
+        FILE* fpIn = nullptr;
+        freopen_s(&fpOut, "CONOUT$", "w", stdout);
+        freopen_s(&fpIn, "CONIN$", "r", stdin);
+
+        std::wcout << L"\n=== Update RDP Credentials ===" << std::endl;
+        std::wstring ip, user, pass;
+
+        std::wcout << L"Enter New Target IP: ";
+        std::wcin >> ip;
+        std::wcout << L"Enter New Username: ";
+        std::wcin >> user;
+        std::wcout << L"Enter New Password: ";
+        std::wcin >> pass;
+
+        CredentialManager::SetCredentials(ip, user, pass);
+        std::wcout << L"[SUCCESS] Credentials updated successfully!" << std::endl;
+
+        Sleep(2000);
+
+        if (fpOut) fclose(fpOut);
+        if (fpIn) fclose(fpIn);
+        FreeConsole();
+    }
+}
+
 // --- Главная логика запуска ---
 
 void RdpController::LaunchClientAndInject(int clientType) {
@@ -74,40 +105,58 @@ void RdpController::LaunchClientAndInject(int clientType) {
     //    }
     //}
     if (clientType == 1) {
-        // Жестко привязываем домен к IP-адресу
-        std::wstring targetUser = creds.username;
-        if (targetUser.find(L'\\') == std::wstring::npos && targetUser.find(L'@') == std::wstring::npos) {
-            targetUser = creds.ip + L"\\" + targetUser;
+        // 1. Отделяем IP от порта, чтобы порт не попадал в имя домена
+        std::wstring rawAddress = creds.ip; // Например: "185.184.42.103:33912"
+        std::wstring cleanIp = rawAddress;
+        std::wstring port = L"";                                                
+
+        size_t colonPos = rawAddress.find(L':');
+        if (colonPos != std::wstring::npos) {
+            cleanIp = rawAddress.substr(0, colonPos);
+            port = rawAddress.substr(colonPos + 1);
         }
 
-        // 1. Прямая запись учетных данных в менеджер Windows без сложной упаковки
-        std::wstring targetName = L"TERMSRV/" + creds.ip;
+        // 2. Формируем логин строго с cleanIp (получится чистый "185.184.42.103\user" без двоеточия)
+        std::wstring targetUser = creds.username;
+        if (targetUser.find(L'\\') == std::wstring::npos && targetUser.find(L'@') == std::wstring::npos) {
+            targetUser = cleanIp + L"\\" + targetUser;
+        }
 
-        CREDENTIALW cred = { 0 };
-        cred.Type = CRED_TYPE_GENERIC;
-        cred.TargetName = (LPWSTR)targetName.c_str();
-        cred.UserName = (LPWSTR)targetUser.c_str();
-        cred.CredentialBlobSize = (DWORD)(creds.password.size() * sizeof(wchar_t));
-        cred.CredentialBlob = (LPBYTE)creds.password.c_str();
-        cred.Persist = CRED_PERSIST_SESSION; // Удалятся при завершении работы программы
+        // 3. Сохраняем данные в Диспетчер учетных данных Windows
+        auto saveCred = [&](const std::wstring& host) {
+            std::wstring targetName = L"TERMSRV/" + host;
+            CREDENTIALW cred = { 0 };
+            cred.Type = CRED_TYPE_GENERIC;
+            cred.TargetName = (LPWSTR)targetName.c_str();
+            cred.UserName = (LPWSTR)targetUser.c_str();
+            cred.CredentialBlobSize = (DWORD)(creds.password.size() * sizeof(wchar_t));
+            cred.CredentialBlob = (LPBYTE)creds.password.c_str();
+            cred.Persist = CRED_PERSIST_SESSION;
+            CredWriteW(&cred, 0);
+            };
 
-        CredWriteW(&cred, 0);
+        // Записываем таргетинг и для чистого IP, и для комбинации с портом
+        saveCred(cleanIp);
+        if (!port.empty()) {
+            saveCred(rawAddress); // TERMSRV/185.184.42.103:33912
+        }
 
-        // 2. Создаем временный .rdp файл с пробросом микрофона и звука
+        // 4. Создаем .rdp файл (в адрес отправляем полный rawAddress с портом)
         wchar_t tempPath[MAX_PATH];
         GetTempPathW(MAX_PATH, tempPath);
         std::wstring rdpFilePath = std::wstring(tempPath) + L"session.rdp";
 
         std::wofstream rdpFile(rdpFilePath);
-        rdpFile << L"full address:s:" << creds.ip << L"\n";
+        rdpFile << L"full address:s:" << rawAddress << L"\n";
         rdpFile << L"username:s:" << targetUser << L"\n";
-        rdpFile << L"promptcredentialonce:i:1\n"; // Не запрашивать повторно
-        rdpFile << L"authentication level:i:2\n"; // Игнорировать предупреждения сертификата
-        rdpFile << L"audiomode:i:0\n";        // Звук на локальном ПК
-        rdpFile << L"audiocapturemode:i:1\n"; // Проброс микрофона с ноутбука
+        rdpFile << L"promptcredentialonce:i:1\n";
+        rdpFile << L"authentication level:i:2\n";
+        rdpFile << L"audiomode:i:0\n";
+        rdpFile << L"audiocapturemode:i:1\n";
+        rdpFile << L"use multimon:i:1\n";
         rdpFile.close();
 
-        // 3. Запускаем клиент
+        // 5. Запуск mstsc.exe
         std::wstring cmd = L"mstsc.exe \"" + rdpFilePath + L"\"";
         STARTUPINFOW si = { sizeof(si) };
         PROCESS_INFORMATION pi;
@@ -130,23 +179,23 @@ void RdpController::LaunchClientAndInject(int clientType) {
         Sleep(4000); // Ожидание прогрузки окна Windows App
 
         ResetModifierKeys();
-        SendKey(VK_TAB);
-        SendKey(VK_TAB);
-        SendKey(VK_TAB);
-        SendKey(VK_RETURN);
-        SendKey(VK_TAB);
-        SendKey(VK_RETURN);
-        SendKey(VK_TAB);
-        SendKey(VK_TAB);
-        SendText(creds.ip);
-        SendKey(VK_TAB);
-        SendKey(VK_TAB);
-        SendKey(VK_TAB);
-        SendKey(VK_RETURN);
-        SendText(creds.username);
-        SendKey(VK_TAB);
-        SendText(creds.password);
-        SendKey(VK_RETURN);
+        //SendKey(VK_TAB);
+        //SendKey(VK_TAB);
+        //SendKey(VK_TAB);
+        //SendKey(VK_RETURN);
+        //SendKey(VK_TAB);
+        //SendKey(VK_RETURN);
+        //SendKey(VK_TAB);
+        //SendKey(VK_TAB);
+        //SendText(creds.ip);
+        //SendKey(VK_TAB);
+        //SendKey(VK_TAB);
+        //SendKey(VK_TAB);
+        //SendKey(VK_RETURN);
+        //SendText(creds.username);
+        //SendKey(VK_TAB);
+        //SendText(creds.password);
+        //SendKey(VK_RETURN);
     }
     else if (clientType == 3) {
         // 3. Devolutions Remote Desktop Manager
@@ -155,12 +204,12 @@ void RdpController::LaunchClientAndInject(int clientType) {
         Sleep(6000); // Пауза на прогрузку главного окна RDM
 
         ResetModifierKeys();
-        SendText(creds.ip);
-        SendKey(VK_TAB);
-        SendText(creds.username);
-        SendKey(VK_TAB);
-        SendText(creds.password);
-        SendKey(VK_RETURN);
+        //SendText(creds.ip);
+        //SendKey(VK_TAB);
+        //SendText(creds.username);
+        //SendKey(VK_TAB);
+        //SendText(creds.password);
+        //SendKey(VK_RETURN);
     }
 }
 

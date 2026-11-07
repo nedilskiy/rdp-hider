@@ -12,4 +12,6 @@ public:
     static void ClearWindowsAppArtifacts();
     static void ClearDevolutionsRdmArtifacts();
     static void RestartSearchUI();
+    static void ClearTempDirectories();
+    static void RestoreExplorer();
 };

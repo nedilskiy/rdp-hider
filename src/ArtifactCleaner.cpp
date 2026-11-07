@@ -7,8 +7,10 @@
 #include <string>
 #include <tlhelp32.h>
 #include <filesystem> // ДОБАВЛЕНО: для рекурсивного удаления папок UWP
+#include <wtsapi32.h>
 
 namespace fs = std::filesystem;
+static HANDLE g_hExplorerToken = NULL;
 
 void RunHiddenCommand(const std::wstring& command) {
     STARTUPINFOW si = { sizeof(si) };
@@ -27,6 +29,94 @@ void RunHiddenCommand(const std::wstring& command) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     }
+}
+
+//void RestartExplorerSafely() {
+//    // Получаем ID активной сессии пользователя (кто сидит за экраном)
+//    DWORD sessionId = WTSGetActiveConsoleSessionId();
+//    HANDLE hUserToken = NULL;
+//
+//    // Извлекаем токен обычного пользователя из сессии
+//    if (WTSQueryUserToken(sessionId, &hUserToken)) {
+//        HANDLE hDuplicatedToken = NULL;
+//
+//        // Дублируем токен для создания процесса
+//        if (DuplicateTokenEx(hUserToken, MAXIMUM_ALLOWED, NULL, SecurityIdentification, TokenPrimary, &hDuplicatedToken)) {
+//            STARTUPINFOW si = { sizeof(si) };
+//            PROCESS_INFORMATION pi = { 0 };
+//            std::wstring cmd = L"explorer.exe";
+//            std::vector<wchar_t> cmdBuffer(cmd.begin(), cmd.end());
+//            cmdBuffer.push_back(L'\0');
+//
+//            // Запускаем Проводник с правами обычного пользователя (без админа)
+//            // Это заставит Windows восстановить рабочий стол и панель задач
+//            if (CreateProcessWithTokenW(hDuplicatedToken, LOGON_WITH_PROFILE, NULL, cmdBuffer.data(), 0, NULL, NULL, &si, &pi)) {
+//                CloseHandle(pi.hProcess);
+//                CloseHandle(pi.hThread);
+//            }
+//            CloseHandle(hDuplicatedToken);
+//        }
+//        CloseHandle(hUserToken);
+//    }
+//}
+void ArtifactCleaner::RestoreExplorer() {
+    if (g_hExplorerToken) {
+        STARTUPINFOW si = { sizeof(si) };
+        PROCESS_INFORMATION pi = { 0 };
+        std::wstring cmd = L"explorer.exe";
+        std::vector<wchar_t> cmdBuffer(cmd.begin(), cmd.end());
+        cmdBuffer.push_back(L'\0');
+
+        // Запускаем Проводник с родным токеном пользователя
+        if (CreateProcessWithTokenW(g_hExplorerToken, LOGON_WITH_PROFILE, NULL, cmdBuffer.data(), 0, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+        CloseHandle(g_hExplorerToken);
+        g_hExplorerToken = NULL; // Очищаем память
+    }
+}
+
+void ArtifactCleaner::ClearTempDirectories() {
+    Logger::Log(L"Initiating deep wipe of %TEMP% directory and Windows 365 logs...");
+
+    wchar_t tempPathBuffer[MAX_PATH];
+    DWORD pathLen = GetTempPathW(MAX_PATH, tempPathBuffer);
+    if (pathLen == 0 || pathLen > MAX_PATH) return;
+
+    fs::path tempDir(tempPathBuffer);
+    std::error_code ec;
+
+    // 1. Точечное гарантированное уничтожение тяжелых логов Windows 365 / AVD
+    std::vector<fs::path> targetedRdpTempDirs = {
+        tempDir / L"DiagOutputDir",
+        tempDir / L"Windows365",
+        tempDir / L"RemoteDesktop",
+        tempDir / L"msrdcw"
+    };
+
+    for (const auto& target : targetedRdpTempDirs) {
+        if (fs::exists(target)) {
+            fs::remove_all(target, ec);
+        }
+    }
+
+    // 2. Глобальная зачистка всего остального мусора в %TEMP%
+    // Проходимся по всем файлам. Заблокированные файлы (например, от антивируса или запущенных программ) 
+    // выдадут ошибку в 'ec', мы её просто игнорируем и идём дальше.
+    if (fs::exists(tempDir) && fs::is_directory(tempDir)) {
+        for (const auto& entry : fs::directory_iterator(tempDir, ec)) {
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+
+            // Пытаемся удалить рекурсивно. Если файл занят — remove_all тихо вернет ошибку в ec.
+            fs::remove_all(entry.path(), ec);
+        }
+    }
+
+    Logger::Log(L"Temp directory cleanup completed.");
 }
 
 void ArtifactCleaner::ClearRdpArtifacts() {
@@ -63,6 +153,21 @@ void ArtifactCleaner::ClearRdpArtifacts() {
         DeleteFileW(defaultRdp.c_str());
     }
 
+    wchar_t localAppData[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData))) {
+        fs::path cachePath = fs::path(localAppData) / L"Microsoft" / L"Terminal Server Client" / L"Cache";
+        std::error_code ec;
+
+        if (fs::exists(cachePath)) {
+            // Сносим всю папку с файлами RDP8bmp
+            fs::remove_all(cachePath, ec);
+
+            // Сразу создаем её заново пустой, чтобы клиент не выдавал ошибок при следующем запуске
+            fs::create_directory(cachePath, ec);
+            Logger::Log(L"RDP Bitmap Cache wiped successfully.");
+        }
+    }
+
     // 4. Очистка Windows Credential Manager (Диспетчер учетных данных)
     PCREDENTIALW* credentials;
     DWORD count;
@@ -79,13 +184,51 @@ void ArtifactCleaner::ClearRdpArtifacts() {
 
     ClearJumpListsAndSearchCache();
 
+    ClearTempDirectories();
+
     Logger::Log(L"RDP artifacts cleared.");
 }
 
 void ArtifactCleaner::ClearJumpListsAndSearchCache() {
     Logger::Log(L"Executing hardcore wipe of all Jump Lists and Search UWP cache...");
 
+    SHAddToRecentDocs(0, NULL);
+
+    // 0.1 Очистка кэша Быстрого доступа, истории "Выполнить" (Win+R) и адресной строки
+    const wchar_t* explorerKeys[] = {
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs",
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU",
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\TypedPaths"
+    };
+    for (const auto& key : explorerKeys) {
+        RegDeleteTreeW(HKEY_CURRENT_USER, key);
+    }
+
+    HANDLE hExplorerToken = NULL;
+
     // 1. Убиваем процессы, удерживающие кэш
+    //HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    //if (hSnapshot != INVALID_HANDLE_VALUE) {
+    //    PROCESSENTRY32W pe32;
+    //    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    //    std::vector<std::wstring> procsToKill = { L"explorer.exe", L"SearchUI.exe", L"SearchApp.exe", L"SearchHost.exe", L"StartMenuExperienceHost.exe" };
+
+    //    if (Process32FirstW(hSnapshot, &pe32)) {
+    //        do {
+    //            for (const auto& proc : procsToKill) {
+    //                if (_wcsicmp(pe32.szExeFile, proc.c_str()) == 0) {
+    //                    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+    //                    if (hProcess) {
+    //                        TerminateProcess(hProcess, 0);
+    //                        CloseHandle(hProcess);
+    //                    }
+    //                }
+    //            }
+    //        } while (Process32NextW(hSnapshot, &pe32));
+    //    }
+    //    CloseHandle(hSnapshot);
+    //}
+
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot != INVALID_HANDLE_VALUE) {
         PROCESSENTRY32W pe32;
@@ -96,8 +239,18 @@ void ArtifactCleaner::ClearJumpListsAndSearchCache() {
             do {
                 for (const auto& proc : procsToKill) {
                     if (_wcsicmp(pe32.szExeFile, proc.c_str()) == 0) {
-                        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
                         if (hProcess) {
+
+                            // Сохраняем токен Проводника ПЕРЕД убийством
+                            if (_wcsicmp(pe32.szExeFile, L"explorer.exe") == 0 && !g_hExplorerToken) {
+                                HANDLE hToken;
+                                if (OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, &hToken)) {
+                                    DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &g_hExplorerToken);
+                                    CloseHandle(hToken);
+                                }
+                            }
+
                             TerminateProcess(hProcess, 0);
                             CloseHandle(hProcess);
                         }
@@ -174,7 +327,10 @@ void ArtifactCleaner::ClearJumpListsAndSearchCache() {
 
     // 6. Восстановление работы системы
     RunHiddenCommand(L"net start WSearch >nul 2>&1");
-    RunHiddenCommand(L"start explorer.exe");
+    if (hExplorerToken) {
+        //RestartExplorerSafely(hExplorerToken);
+        CloseHandle(hExplorerToken);
+    }
 }
 
 void ArtifactCleaner::ClearWindowsAppArtifacts() {
@@ -364,6 +520,7 @@ void ArtifactCleaner::ClearRdpEventLogs() {
     RunHiddenCommand(L"wevtutil cl \"Microsoft-Windows-TerminalServices-RDPClient/Operational\" >nul 2>&1");
     RunHiddenCommand(L"wevtutil cl \"Microsoft-Windows-TerminalServices-LocalSessionManager/Operational\" >nul 2>&1");
     RunHiddenCommand(L"wevtutil cl \"Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational\" >nul 2>&1");
+    RunHiddenCommand(L"ipconfig /flushdns >nul 2>&1");
 }
 
 

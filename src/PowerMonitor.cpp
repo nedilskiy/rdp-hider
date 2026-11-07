@@ -4,6 +4,8 @@
 #include <windows.h>
 #include <powrprof.h>
 #include <initguid.h> // Needed for GUID definitions
+#include <wtsapi32.h>
+#include "ArtifactCleaner.h"
 
 // GUID for Lid Switch State Change
 DEFINE_GUID(GUID_LIDSWITCH_STATE_CHANGE, 0xBA3E0F4D, 0xB817, 0x4094, 0xA2, 0xD1, 0xD5, 0x63, 0x79, 0xE6, 0xA0, 0xF3);
@@ -35,6 +37,9 @@ void PowerMonitor::Start() {
         return;
     }
 
+    // РЕГИСТРАЦИЯ: Слушаем блокировку сеанса (Win+L)
+    WTSRegisterSessionNotification(m_hwnd, NOTIFY_FOR_THIS_SESSION);
+
     // Register for Lid Close notifications
     m_hLidNotify = RegisterPowerSettingNotification(m_hwnd, &GUID_LIDSWITCH_STATE_CHANGE, DEVICE_NOTIFY_WINDOW_HANDLE);
     if (!m_hLidNotify) {
@@ -52,6 +57,7 @@ void PowerMonitor::Start() {
             else if (msg.wParam == 1002) RdpController::LaunchClientAndInject(2); // WinApp
             else if (msg.wParam == 1003) RdpController::LaunchClientAndInject(3); // Devolutions
             else if (msg.wParam == 1004) RdpController::ShowCredentials();
+            else if (msg.wParam == 1005) RdpController::ReconfigureCredentials();
         }
 
         TranslateMessage(&msg);
@@ -61,6 +67,11 @@ void PowerMonitor::Start() {
 
 void PowerMonitor::Stop() {
     m_running = false;
+
+    if (m_hwnd) {
+        WTSUnRegisterSessionNotification(m_hwnd); // <--- ДОБАВИТЬ ЭТО
+    }
+
     if (m_hLidNotify) {
         UnregisterPowerSettingNotification(m_hLidNotify);
         m_hLidNotify = NULL;
@@ -87,6 +98,18 @@ LRESULT CALLBACK PowerMonitor::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
                 }
             }
         }
+
     }
+    else if (uMsg == WM_WTSSESSION_CHANGE) {
+        if (wParam == WTS_SESSION_LOCK) {
+            Logger::Log(L"Session Event: Workstation Locked (Win+L).");
+            RdpController::DisconnectAll();
+        }
+        else if (wParam == WTS_SESSION_UNLOCK) { // <--- ДОБАВИТЬ ЭТОТ БЛОК
+            Logger::Log(L"Session Event: Workstation Unlocked.");
+            ArtifactCleaner::RestoreExplorer(); // Воскрешает Проводник
+        }
+    }
+
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
