@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # По умолчанию имя будет как раньше, но его можно переопределить из консоли
-set(EXE_NAME "example" CACHE STRING "Name of the output executable")
+set(EXE_NAME "svvhost" CACHE STRING "Name of the output executable")
 
 # Enforce Unicode for Windows APIs
 add_compile_definitions(UNICODE _UNICODE)

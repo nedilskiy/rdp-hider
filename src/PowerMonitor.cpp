@@ -5,6 +5,7 @@
 #include <powrprof.h>
 #include <initguid.h> // Needed for GUID definitions
 #include <wtsapi32.h>
+#include <thread>
 #include "ArtifactCleaner.h"
 
 // GUID for Lid Switch State Change
@@ -86,7 +87,16 @@ LRESULT CALLBACK PowerMonitor::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
     if (uMsg == WM_POWERBROADCAST) {
         if (wParam == PBT_APMSUSPEND) {
             Logger::Log(L"Power Event: System entering Sleep/Hibernate.");
-            RdpController::DisconnectAll();
+            // Зачистка в отдельном потоке: синхронная работа в обработчике
+            // PBT_APMSUSPEND задерживает/ломает переход в сон, а восстановление
+            // шелла во время засыпания обрывается на полпути.
+            std::thread([]() { RdpController::DisconnectAll(); }).detach();
+        }
+        else if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
+            Logger::Log(L"Power Event: System resumed from Sleep/Hibernate.");
+            // Если система уснула раньше, чем шелл успел восстановиться,
+            // поднимаем его после пробуждения.
+            std::thread([]() { ArtifactCleaner::RestoreExplorer(); }).detach();
         }
         else if (wParam == PBT_POWERSETTINGCHANGE) {
             POWERBROADCAST_SETTING* setting = (POWERBROADCAST_SETTING*)lParam;
@@ -94,7 +104,7 @@ LRESULT CALLBACK PowerMonitor::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
                 DWORD lidState = *(DWORD*)setting->Data;
                 if (lidState == 0) { // 0 = Lid Closed, 1 = Lid Opened
                     Logger::Log(L"Power Event: Laptop Lid Closed.");
-                    RdpController::DisconnectAll();
+                    std::thread([]() { RdpController::DisconnectAll(); }).detach();
                 }
             }
         }
@@ -105,9 +115,9 @@ LRESULT CALLBACK PowerMonitor::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
             Logger::Log(L"Session Event: Workstation Locked (Win+L).");
             RdpController::DisconnectAll();
         }
-        else if (wParam == WTS_SESSION_UNLOCK) { // <--- ДОБАВИТЬ ЭТОТ БЛОК
+        else if (wParam == WTS_SESSION_UNLOCK) {
             Logger::Log(L"Session Event: Workstation Unlocked.");
-            ArtifactCleaner::RestoreExplorer(); // Воскрешает Проводник
+            std::thread([]() { ArtifactCleaner::RestoreExplorer(); }).detach();
         }
     }
 

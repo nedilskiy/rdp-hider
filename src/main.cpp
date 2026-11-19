@@ -327,6 +327,44 @@ bool InstallAndSelfDelete(HINSTANCE hInstance, LPWSTR lpCmdLine) {
     return false;
 }
 
+// --- Глобальный перехват хоткеев через low-level keyboard hook ---
+// RegisterHotKey эксклюзивен: комбинацию получает тот, кто зарегистрировал её
+// первым. LL-хук видит клавиши раньше всех и может «проглотить» нажатие,
+// поэтому наши комбинации получают приоритет над чужими приложениями.
+static HHOOK g_hKeyboardHook = NULL;
+static DWORD g_lastHotkeyTime[5] = { 0 };
+
+static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+        KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
+        bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+
+        if (ctrl && alt) {
+            WPARAM hotkeyId = 0;
+            switch (kb->vkCode) {
+            case '1':  hotkeyId = 1001; break;
+            case '2':  hotkeyId = 1002; break;
+            case '3':  hotkeyId = 1003; break;
+            case 0xDC: hotkeyId = 1004; break;
+            case 'R':  hotkeyId = 1005; break;
+            }
+
+            if (hotkeyId != 0) {
+                DWORD now = GetTickCount();
+                DWORD idx = (DWORD)(hotkeyId - 1001);
+                // Антидребезг: игнорируем автоповтор при зажатой клавише
+                if (now - g_lastHotkeyTime[idx] > 1000) {
+                    g_lastHotkeyTime[idx] = now;
+                    PostThreadMessageW(GetCurrentThreadId(), WM_HOTKEY, hotkeyId, 0);
+                }
+                return 1; // Проглатываем нажатие — чужие приложения его не получат
+            }
+        }
+    }
+    return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow) {
     CheckAndInstallVCRedist();
 
@@ -364,20 +402,19 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
 
     RdpController::StartProcessMonitor();
 
-    RegisterHotKey(NULL, 1001, MOD_CONTROL | MOD_ALT, '1');
-    RegisterHotKey(NULL, 1002, MOD_CONTROL | MOD_ALT, '2');
-    RegisterHotKey(NULL, 1003, MOD_CONTROL | MOD_ALT, '3');
-    RegisterHotKey(NULL, 1004, MOD_CONTROL | MOD_ALT, 0xDC);
-    RegisterHotKey(NULL, 1005, MOD_CONTROL | MOD_ALT, 'R');
+    // Хоткеи через LL-хук вместо RegisterHotKey — приоритет над чужими приложениями
+    g_hKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(NULL), 0);
+    if (!g_hKeyboardHook) {
+        Logger::LogEvent(L"Failed to install low-level keyboard hook.");
+    }
 
     PowerMonitor monitor;
     monitor.Start();
 
-    UnregisterHotKey(NULL, 1001);
-    UnregisterHotKey(NULL, 1002);
-    UnregisterHotKey(NULL, 1003);
-    UnregisterHotKey(NULL, 1004);
-    UnregisterHotKey(NULL, 1005);
+    if (g_hKeyboardHook) {
+        UnhookWindowsHookEx(g_hKeyboardHook);
+        g_hKeyboardHook = NULL;
+    }
     CredentialManager::Clear();
 
     return 0;

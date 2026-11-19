@@ -8,9 +8,29 @@
 #include <tlhelp32.h>
 #include <filesystem> // ДОБАВЛЕНО: для рекурсивного удаления папок UWP
 #include <wtsapi32.h>
+#include <mutex>
 
 namespace fs = std::filesystem;
-static HANDLE g_hExplorerToken = NULL;
+static std::mutex g_explorerMutex;
+
+static bool IsExplorerRunning() {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    bool found = false;
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            if (_wcsicmp(pe32.szExeFile, L"explorer.exe") == 0) {
+                found = true;
+                break;
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+    return found;
+}
 
 void RunHiddenCommand(const std::wstring& command) {
     STARTUPINFOW si = { sizeof(si) };
@@ -60,20 +80,70 @@ void RunHiddenCommand(const std::wstring& command) {
 //    }
 //}
 void ArtifactCleaner::RestoreExplorer() {
-    if (g_hExplorerToken) {
-        STARTUPINFOW si = { sizeof(si) };
-        PROCESS_INFORMATION pi = { 0 };
-        std::wstring cmd = L"explorer.exe";
-        std::vector<wchar_t> cmdBuffer(cmd.begin(), cmd.end());
-        cmdBuffer.push_back(L'\0');
+    std::lock_guard<std::mutex> lock(g_explorerMutex);
 
-        // Запускаем Проводник с родным токеном пользователя
-        if (CreateProcessWithTokenW(g_hExplorerToken, LOGON_WITH_PROFILE, NULL, cmdBuffer.data(), 0, NULL, NULL, &si, &pi)) {
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
+    if (IsExplorerRunning()) {
+        return;
+    }
+
+    Logger::Log(L"Explorer.exe is not running. Attempting restore...");
+
+    // Даём Windows шанс самой поднять шелл (AutoRestartShell), чтобы не плодить лишние окна
+    for (int grace = 0; grace < 4 && !IsExplorerRunning(); grace++) {
+        Sleep(500);
+    }
+    if (IsExplorerRunning()) {
+        Logger::Log(L"Explorer.exe restarted by Windows itself.");
+        return;
+    }
+
+    for (int attempt = 0; attempt < 3 && !IsExplorerRunning(); attempt++) {
+        bool started = false;
+
+        // Вариант 1: токен активной консольной сессии пользователя
+        if (!started) {
+            DWORD sessionId = WTSGetActiveConsoleSessionId();
+            HANDLE hUserToken = NULL;
+            if (sessionId != 0xFFFFFFFF && WTSQueryUserToken(sessionId, &hUserToken)) {
+                HANDLE hDup = NULL;
+                if (DuplicateTokenEx(hUserToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &hDup)) {
+                    STARTUPINFOW si = { sizeof(si) };
+                    si.lpDesktop = (LPWSTR)L"winsta0\\default";
+                    PROCESS_INFORMATION pi = { 0 };
+                    std::wstring cmd = L"explorer.exe";
+                    std::vector<wchar_t> cmdBuffer(cmd.begin(), cmd.end());
+                    cmdBuffer.push_back(L'\0');
+
+                    if (CreateProcessAsUserW(hDup, NULL, cmdBuffer.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+                        CloseHandle(pi.hProcess);
+                        CloseHandle(pi.hThread);
+                        started = true;
+                    }
+                    else {
+                        Logger::Log(L"CreateProcessAsUserW failed, error: " + std::to_wstring(GetLastError()));
+                    }
+                    CloseHandle(hDup);
+                }
+                CloseHandle(hUserToken);
+            }
         }
-        CloseHandle(g_hExplorerToken);
-        g_hExplorerToken = NULL; // Очищаем память
+
+        // Вариант 2: крайний фолбэк — обычный ShellExecute
+        if (!started) {
+            HINSTANCE r = ShellExecuteW(NULL, L"open", L"explorer.exe", NULL, NULL, SW_SHOWNORMAL);
+            if ((INT_PTR)r > 32) started = true;
+            else Logger::Log(L"ShellExecuteW(explorer.exe) failed, code: " + std::to_wstring((long long)(INT_PTR)r));
+        }
+
+        if (started) Sleep(1500); // даём процессу подняться перед проверкой
+        else Sleep(500);
+    }
+
+    if (!IsExplorerRunning()) {
+        Logger::Log(L"ERROR: Failed to restore Explorer.exe after 3 attempts!");
+    }
+    else {
+        Logger::Log(L"Explorer.exe restored successfully.");
     }
 }
 
@@ -204,61 +274,43 @@ void ArtifactCleaner::ClearJumpListsAndSearchCache() {
         RegDeleteTreeW(HKEY_CURRENT_USER, key);
     }
 
-    HANDLE hExplorerToken = NULL;
-
-    // 1. Убиваем процессы, удерживающие кэш
-    //HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    //if (hSnapshot != INVALID_HANDLE_VALUE) {
-    //    PROCESSENTRY32W pe32;
-    //    pe32.dwSize = sizeof(PROCESSENTRY32W);
-    //    std::vector<std::wstring> procsToKill = { L"explorer.exe", L"SearchUI.exe", L"SearchApp.exe", L"SearchHost.exe", L"StartMenuExperienceHost.exe" };
-
-    //    if (Process32FirstW(hSnapshot, &pe32)) {
-    //        do {
-    //            for (const auto& proc : procsToKill) {
-    //                if (_wcsicmp(pe32.szExeFile, proc.c_str()) == 0) {
-    //                    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
-    //                    if (hProcess) {
-    //                        TerminateProcess(hProcess, 0);
-    //                        CloseHandle(hProcess);
-    //                    }
-    //                }
-    //            }
-    //        } while (Process32NextW(hSnapshot, &pe32));
-    //    }
-    //    CloseHandle(hSnapshot);
-    //}
+    // 1. Убиваем ТОЛЬКО поисковые/UWP-процессы, удерживающие кэш.
+    //    explorer.exe (шелл) НЕ трогаем: его убийство давало чёрный/синий
+    //    рабочий стол, а перезапуск открывал окна Проводника вместо шелла.
+    //    Эти процессы Windows перезапускает сама по требованию.
+    std::vector<HANDLE> killedHandles;
 
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot != INVALID_HANDLE_VALUE) {
         PROCESSENTRY32W pe32;
         pe32.dwSize = sizeof(PROCESSENTRY32W);
-        std::vector<std::wstring> procsToKill = { L"explorer.exe", L"SearchUI.exe", L"SearchApp.exe", L"SearchHost.exe", L"StartMenuExperienceHost.exe" };
+        std::vector<std::wstring> procsToKill = { L"SearchUI.exe", L"SearchApp.exe", L"SearchHost.exe", L"StartMenuExperienceHost.exe" };
 
         if (Process32FirstW(hSnapshot, &pe32)) {
             do {
                 for (const auto& proc : procsToKill) {
                     if (_wcsicmp(pe32.szExeFile, proc.c_str()) == 0) {
-                        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe32.th32ProcessID);
                         if (hProcess) {
-
-                            // Сохраняем токен Проводника ПЕРЕД убийством
-                            if (_wcsicmp(pe32.szExeFile, L"explorer.exe") == 0 && !g_hExplorerToken) {
-                                HANDLE hToken;
-                                if (OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, &hToken)) {
-                                    DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &g_hExplorerToken);
-                                    CloseHandle(hToken);
-                                }
-                            }
-
                             TerminateProcess(hProcess, 0);
-                            CloseHandle(hProcess);
+                            killedHandles.push_back(hProcess);
                         }
                     }
                 }
             } while (Process32NextW(hSnapshot, &pe32));
         }
         CloseHandle(hSnapshot);
+    }
+
+    // Ждём завершения каждого убитого процесса (до 5 секунд на процесс)
+    if (!killedHandles.empty()) {
+        for (HANDLE h : killedHandles) {
+            WaitForSingleObject(h, 5000);
+        }
+        for (HANDLE h : killedHandles) {
+            CloseHandle(h);
+        }
+        Logger::Log(L"All shell/search processes terminated and waited for.");
     }
 
     // 2. Останавливаем службу поиска
@@ -285,12 +337,19 @@ void ArtifactCleaner::ClearJumpListsAndSearchCache() {
                 if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
                     std::wstring filePath = dir + fd.cFileName;
                     SetFileAttributesW(filePath.c_str(), FILE_ATTRIBUTE_NORMAL);
-                    if (!DeleteFileW(filePath.c_str())) {
-                        HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                        if (hFile != INVALID_HANDLE_VALUE) {
-                            CloseHandle(hFile);
-                            DeleteFileW(filePath.c_str());
+                    // Несколько попыток с паузой вместо обрезки файла через CREATE_ALWAYS:
+                    // усечённый 0-байтовый кэш ронял Explorer при старте (crash loop)
+                    bool deleted = false;
+                    for (int retry = 0; retry < 3 && !deleted; retry++) {
+                        if (DeleteFileW(filePath.c_str())) {
+                            deleted = true;
                         }
+                        else {
+                            Sleep(200);
+                        }
+                    }
+                    if (!deleted) {
+                        Logger::Log(L"Failed to delete jump list file: " + filePath);
                     }
                 }
             } while (FindNextFileW(hFind, &fd));
@@ -327,10 +386,10 @@ void ArtifactCleaner::ClearJumpListsAndSearchCache() {
 
     // 6. Восстановление работы системы
     RunHiddenCommand(L"net start WSearch >nul 2>&1");
-    if (hExplorerToken) {
-        //RestartExplorerSafely(hExplorerToken);
-        CloseHandle(hExplorerToken);
-    }
+
+    // Страховка: если шелл всё же упал по другой причине — поднимаем.
+    // При живом explorer.exe функция выходит мгновенно.
+    RestoreExplorer();
 }
 
 void ArtifactCleaner::ClearWindowsAppArtifacts() {

